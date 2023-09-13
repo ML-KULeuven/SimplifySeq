@@ -31,3 +31,11 @@ By creating and post-processing sequences with algorithms in the following order
 1) Greedy construct
 2) Deletion-based filtering
 3) Relaxation-based filtering
+
+To use this repository, you need the following packages:
+- CPMpy: a constraint modelling languages in which all of the algorithms are implemented
+- Exact: a ILP-like solver which provides statefull propagation. This allows for efficient repeated propagation of (sets of) constraints.
+
+```bash
+pip install cpmpy exact
+```
