@@ -8,7 +8,7 @@ import numpy as np
 from cpmpy.transformations.get_variables import get_variables
 from cpmpy.transformations.normalize import toplevel_list
 
-from .datastructures import EPSILON
+from .utils import EPSILON
 from .propagate import MaximalPropagate, ExactPropagate
 import cpmpy as cp
 

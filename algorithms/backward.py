@@ -6,8 +6,8 @@ import cpmpy as cp
 from cpmpy.tools.explain import mus, smus
 from cpmpy.transformations.get_variables import get_variables
 
-from .datastructures import EPSILON
 from .propagate import ExactPropagate, CPPropagate, filter_lits_to_vars
+from .utils import EPSILON
 
 
 def filter_sequence(seq, goal_literals, time_limit, propagator_class=ExactPropagate):

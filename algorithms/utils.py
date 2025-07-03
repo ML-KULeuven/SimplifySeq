@@ -1,5 +1,7 @@
 import cpmpy as cp
 UNSAT = frozenset({cp.BoolVal(False)})
+EPSILON = 0.01
+
 
 def print_sequence(seq):
     for i, step in enumerate(seq):
