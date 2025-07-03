@@ -4,9 +4,7 @@ from unittest import TestCase
 import cpmpy as cp
 
 from ..algorithms.forward import construct_greedy
-from ..algorithms.datastructures import DomainSet
-from ..algorithms.propagate import CPPropagate, MaximalPropagate, ExactPropagate
-from ..experiments.models import _replace_varnames_constraint
+from ..algorithms.utils import UNSAT, print_sequence
 
 
 class TestFoward(TestCase):
@@ -23,12 +21,11 @@ class TestFoward(TestCase):
 
         assert not cp.Model([c1, c2, c3, c4]).solve()
         seq = construct_greedy(constraints=[c1, c2, c3, c4],
-                                 goal_reduction= DomainSet({v : frozenset() for v in [x,y,z]}),
-                                 time_limit=900,
+                                 goal_literals= UNSAT,
+                                 time_limit=120,
                                  seed=0)
 
-        for step in seq:
-            print(step)
+        print_sequence(seq)
 
         self.assertEqual(len(seq),4)
 
