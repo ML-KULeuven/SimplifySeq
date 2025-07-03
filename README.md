@@ -1,9 +1,12 @@
 # SimplifySeq
 
+
 This repostitory accompanies the following paper published at CP23:
 > Bleukx, Ignace, et al. "Simplifying Step-wise Explanation Sequences." 29th International Conference on Principles and Practice of Constraint Programming (CP 2023). Schloss Dagstuhl-Leibniz-Zentrum für Informatik, 2023.
 
-And provides algorithms to generate and post-process step-wise explanations sequences.
+To run the exact code used to replicate the results of the above paper, checkout tag [`0.1.0`](https://github.com/ML-KULeuven/SimplifySeq/releases/tag/0.1.0).
+
+This repository provides algorithms to generate and post-process step-wise explanations sequences.
 An explanation sequence explains a target set of literals by propagating small subsets of constraints. 
 Each step in such a sequence takes as input literals derived in previous steps, and the constraints to be propagated.
 The output of a step is a new set of literals.
