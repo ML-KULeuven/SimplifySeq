@@ -1,16 +1,42 @@
-import copy
-import time
-
 import cpmpy as cp
 from cpmpy.transformations.get_variables import get_variables
 from cpmpy.expressions.utils import is_any_list
+from cpmpy.expressions.core import Comparison, Expression, BoolVal
+from cpmpy.expressions.variables import _NumVarImpl
+from cpmpy.tools.explain.utils import make_assump_model
+from cpmpy.solvers.solver_interface import ExitStatus
+from cpmpy.transformations.normalize import toplevel_list
 
-from .datastructures import DomainSet, EPSILON
+def filter_lits_to_vars(literals, vars):
+    vars = frozenset(vars)
+    
+    cons_lits= set()
+    for lit in literals:
+        if set(get_variables(lit)) & vars:
+            cons_lits.add(lit)
+
+    return list(cons_lits)
+
+
+def allowed_domain(literals, vars):
+    domainset = {var : set(range(var.lb, var.ub+1)) for var in vars}
+    for lit in literals:
+        if isinstance(lit, BoolVal) and lit.value() is False:
+            return {var : set() for var in vars}
+        assert isinstance(lit, Comparison)
+        assert lit.name == "!="
+        lhs, rhs = lit.args
+        assert isinstance(lhs, _NumVarImpl)
+        assert isinstance(rhs, int)
+        if lhs in domainset:
+            domainset[lhs].remove(rhs)
+
+    return domainset
 
 
 class Propagator:
 
-    def __init__(self, constraints:list, caching=True):
+    def __init__(self, constraints: list, caching=True):
         # bi-level cache with level 1 = constraint(s), level 2 = domains,
         self.cache = dict() if caching else None
         self.vars = set(get_variables(constraints))
@@ -19,54 +45,243 @@ class Propagator:
         for cons in constraints:
             self.scope_cache[cons] = frozenset(get_variables(cons))
 
-
-    def _probe_cache(self, domains, constraints) -> DomainSet:
+    def _probe_cache(self, literals, constraints):
         if self.cache is None: return None
 
-        if not isinstance(constraints, list):
+        assert isinstance(literals, list)
+
+        if isinstance(constraints, Expression):
             constraints = [constraints]
+        cons_vars = frozenset(get_variables(constraints))
+        assert isinstance(constraints, list)
+
         constraints = frozenset(constraints)
         if constraints not in self.cache:
             return None
 
-        cons_vars = set().union(*[self.scope_cache[cons] for cons in constraints])
-        cons_domains = DomainSet({var : domains[var] for var in cons_vars})
-        new_domains = self.cache[constraints].get(cons_domains)
-        if new_domains is not None:
-            # are we in the UNSAT case?
-            if any(len(dom) == 0 for dom in new_domains.values()):
-                return DomainSet({var : frozenset() for var in domains})
+        cons_lits = filter_lits_to_vars(literals, cons_vars)
 
-            new_domains = {var : vals for var, vals in new_domains.items()} # make it a normal dict for now
-            # copy domains of variables not in scope
-            for var, orig_domain in domains.items():
-                if var not in cons_vars:
-                    new_domains[var] = orig_domain
-            return DomainSet(new_domains)
+        # convert to frozenset for hashing
+        cons_lits = frozenset(cons_lits)
+        return self.cache[constraints].get(cons_lits)
 
 
-    def _fill_cache(self, domains, constraints, new_domains):
+    def _fill_cache(self, literals, constraints, new_lits):
         if self.cache is None: return None
-        if not isinstance(constraints, list):
+
+        assert isinstance(constraints, list)
+
+        if isinstance(constraints, Expression):
             constraints = [constraints]
 
+        cons_vars = frozenset(get_variables(constraints))
+
         constraints = frozenset(constraints)
+        cons_lits = frozenset(filter_lits_to_vars(literals, cons_vars))
+        new_lits = frozenset(filter_lits_to_vars(new_lits, cons_vars))
+
         if constraints not in self.cache:
             self.cache[constraints] = dict()
 
-        cons_vars = set().union(*[self.scope_cache[cons] for cons in constraints])
-        domains = DomainSet({var : domains[var] for var in cons_vars})
-        new_domains = DomainSet({var : new_domains[var] for var in cons_vars})
-        self.cache[constraints][domains] = new_domains
-
+        self.cache[constraints][cons_lits] = new_lits
+        return new_lits
 
     def propagate(self, domains, constraints, time_limit):
         raise NotImplementedError(f"Propagation for propagator {type(self)} not implemented")
 
 
+class MaximalPropagate(Propagator):
+    """ Naive implementation of maximal propagation.
+        Enumerates solutions ensuring at least variable has an unseen variable
+    """
+
+    def propagate(self, literals, constraints, solver="ortools",time_limit=3600):
+        """
+            Find all literals that are implied by the constraints an input literals.
+            Also returns input literals, as they are trivially implied.
+        """
+
+        literals = list(literals)
+        constraints = toplevel_list(constraints, merge_and=False)
+
+        # check cache
+        cached = self._probe_cache(literals, constraints)
+        if cached is not None: return cached | literals # re-add input literals
+
+        solver = cp.SolverLookup.get(solver)
+        solver += list(literals) + list(constraints)
+        cons_vars = set(get_variables(constraints))
+
+        values_seen = {var : set() for var in cons_vars}
+        while solver.solve(time_limit=time_limit) is True:
+            time_limit = time_limit - solver.status().runtime
+            if time_limit <= 0:
+                raise TimeoutError("Time limit reached during maximal propagation")
+
+            for var in cons_vars:
+                values_seen[var].add(var.value())
+            
+            # find at least one new value for a variable
+            clause = []
+            for var in cons_vars:
+                clause += [var == val for val in set(range(var.lb, var.ub+1)) - values_seen[var]]
+            solver += cp.any(clause)
+
+        if any(len(values_seen[var]) == 0 for var in cons_vars):
+            return {BoolVal(False)}
+
+        new_lits = []
+        for var in cons_vars:
+            new_lits += [var != val for val in set(range(var.lb, var.ub+1)) - values_seen[var]]
+
+        self._fill_cache(literals, constraints, new_lits)
+        new_lits = frozenset(new_lits) | frozenset(literals) # also input counts
+
+        return new_lits
+
+
+class MaximalPropagateSolveAll(Propagator):
+    """ Alternative implementation of maximal propagate using OR-tools' solveAll function
+        Enumerates all solutions of the constraints, and post-processes them to find all possible values for each variable
+        Can be more efficient than MaximalPropagate if solutions are sparse.
+    """
+
+    def propagate(self, literals, constraints, solver="ortools", time_limit=3600):
+        """
+            Find all literals that are implied by the constraints an input literals.
+            Also returns input literals, as they are trivially implied.
+        """
+
+        literals = list(literals)
+        constraints = toplevel_list(constraints, merge_and=False)
+
+        # check cache
+        cached = self._probe_cache(literals, constraints)
+        if cached is not None: return cached
+
+        # only care about variables in constraints
+        cons_vars = set(get_variables(constraints))
+
+        solver = cp.SolverLookup.get(solver)
+        solver += filter_lits_to_vars(literals, cons_vars)
+        solver += constraints
+
+        visited = {var: set() for var in cons_vars}
+        def callback():
+            for var in cons_vars:
+                visited[var].add(var.value())
+        num_sols = solver.solveAll(display=callback, time_limit=time_limit)
+
+        if solver.status().runtime >= time_limit:
+            raise TimeoutError
+
+        if num_sols == 0:
+            assert solver.status().exitstatus == ExitStatus.UNSATISFIABLE
+            return {cp.BoolVal(False)}
+
+        new_lits = []
+        for var, dom in visited.items():
+            new_lits += [var != val for val in set(range(var.lb, var.ub+1)) - dom]
+
+        # store new domains in cache
+        self._fill_cache(literals, constraints, new_lits)
+        new_lits = frozenset(new_lits) | frozenset(literals) # also input counts
+
+        return new_lits
+
+
+class ExactPropagate(Propagator):
+    """ Exact propagation using the exact solver.
+        Uses Exacts' builtin domain pruning method.
+        Stateful, so can be used repeatedly without re-initializing the solver.
+    """
+
+    def __init__(self, constraints, caching=True):
+        super().__init__(constraints, caching)
+
+        # initialize solver and do all necesessary things in background
+        model, soft, assump = make_assump_model(soft=constraints)
+        self.cons_dict = dict(zip(soft, assump))
+        self.solver = cp.SolverLookup.get("exact")
+        self.solver.encoding = "onehot"
+        self.solver += model.constraints
+        assert self.solver.solve()
+
+    def propagate(self, literals, constraints, time_limit=3600):
+        """
+            Find all literals that are implied by the constraints an input literals.
+            Also returns input literals, as they are trivially implied.
+        """
+
+        literals = list(literals)
+        constraints = toplevel_list(constraints, merge_and=False)
+        
+        # check cache
+        cached = self._probe_cache(literals, constraints)
+        if cached is not None: 
+            return list(frozenset(cached) | frozenset(literals)) # re-add input literals
+
+        self.solver.xct_solver.clearAssumptions()
+        if len(constraints) == 0:
+            cons_vars = get_variables(literals)
+        else:
+            cons_vars = get_variables(constraints)
+        domainset = allowed_domain(literals, cons_vars)
+
+        # set assumptions related to domains
+        assump_list = []
+        for var, values in dict(domainset).items():
+            if set(values) == set(range(var.lb,var.ub+1)):
+                continue # full domain, do not set assumptions
+            elif len(values) == 0: # empty domain, conflict
+                return {BoolVal(False)}
+            else:
+                assump_list.append((self.solver.solver_var(var), list(values)))
+
+        self.solver.xct_solver.setAssumptionsList(assump_list)
+
+        # set assumptions for constraints
+        if len(constraints) > 0:
+            assump = self.solver.solver_vars([self.cons_dict[c] for c in constraints])
+            self.solver.xct_solver.setAssumptions(list(zip(assump, [1]*len(constraints))))
+
+        status, new_domains = self.solver.xct_solver.pruneDomains(vars=self.solver.solver_vars(cons_vars),
+                                                                  timeout=time_limit)
+        
+
+        if status == "TIMEOUT":
+            raise TimeoutError
+        elif status == "INCONSISTENT":
+            return {BoolVal(False)}
+        elif status == "SAT":
+            new_lits = []
+            for var, dom in zip(cons_vars, new_domains):
+                new_lits += [var != val for val in set(range(var.lb, var.ub + 1)) - set(dom)]
+
+            # store new domains in cache
+            self._fill_cache(literals, constraints, new_lits)
+            new_lits = frozenset(new_lits) | frozenset(literals)  # also input counts
+
+            return new_lits
+
+        else:
+            raise ValueError("Unexpected status", status)
+
 
 class CPPropagate(Propagator):
+    """
+        Propagatoar using OR-Tools' presolve function
+        Does root-level propagation so (much) weaker than MaximalPropagate, but very fast.
+    """
 
+    # Required parameters to use the presolve function as propagator
+    req_kwargs = dict(
+        stop_after_presolve=True,
+        keep_all_feasible_solutions_in_presolve=True,
+        fill_tightened_domains_in_response=True
+    )
+
+    # If we want true unit propagation, we need the following parameters
     prop_kwargs = dict(
         cp_model_probing_level = 0,
         presolve_bve_threshold = -1,
@@ -79,254 +294,55 @@ class CPPropagate(Propagator):
         merge_at_most_one_work_limit = 0,
         presolve_substitution_level = 0,
         presolve_inclusion_work_limit = 0,
-
     )
 
-    def propagate(self, domains, constraints, time_limit, only_unit_propagation=True):
+    def propagate(self, literals, constraints, time_limit, only_unit_propagation=True):
+        
+        literals = list(literals)
+        constraints = toplevel_list(constraints, merge_and=False)
 
-        # check cache
-        cached = self._probe_cache(domains, constraints)
-        if cached is not None: return cached
+        # check cache       
+        cached = self._probe_cache(literals, constraints)
+        if cached is not None: 
+            return list(frozenset(cached) | frozenset(literals)) # re-add input literals
 
         # only care about domains of variables in constraints
         cons_vars = set(get_variables(constraints))
 
         solver = cp.SolverLookup.get("ortools")
         solver += constraints
-        for var in cons_vars: # set leftover domains of vars
-            solver += cp.Table([var],[[val] for val in domains[var]])
+        solver += literals
 
+        
         if only_unit_propagation:
-            solver.solve(stop_after_presolve=True,fill_tightened_domains_in_response=True, **self.prop_kwargs)
+            solver.solve(**self.req_kwargs, **self.prop_kwargs)
         else:
-            solver.solve(stop_after_presolve=True, fill_tightened_domains_in_response=True)
+            solver.solve(**self.req_kwargs)
 
         bounds = solver.ort_solver.ResponseProto().tightened_variables
 
         if len(bounds) == 0:
             # UNSAT, no propagation possible
-            prop_dom = {var: set() for var in domains}
-
+            return frozenset({BoolVal(False)})
+    
         else:
-            prop_dom = dict()
-            for var, orig_dom in domains.items():
-                if var not in cons_vars:
-                    prop_dom[var] = orig_dom  # unchanged
-                    continue  # variable not in constraints
-
+            # convert bounded domains to != literals
+            new_lits = []
+            for var in cons_vars:
                 ort_var = solver.solver_var(var)
                 var_bounds = bounds[ort_var.Index()].domain
 
                 lbs = [val for i, val in enumerate(var_bounds) if i % 2 == 0]
                 ubs = [val for i, val in enumerate(var_bounds) if i % 2 == 1]
 
-                prop_dom[var] = set()
+                prop_dom = set()
                 for lb, ub in zip(lbs, ubs):
-                    prop_dom[var] |= set(range(lb, ub + 1))
+                    prop_dom |= set(range(lb, ub + 1))
+                
+                new_lits += [var != val for val in set(range(var.lb, var.ub + 1)) - prop_dom]
 
-        for val, dom in prop_dom.items():
-            prop_dom[val] = frozenset(dom)
+            # store new domains in cache
+            self._fill_cache(literals, constraints, new_lits)
+            new_lits = frozenset(new_lits) | frozenset(literals) # also input counts
 
-        # store new domains in cache
-        self._fill_cache(domains, constraints, prop_dom)
-        return DomainSet(prop_dom)
-
-
-class MaximalPropagate(Propagator):
-    """
-        Maximal propagator
-    """
-
-    def __init__(self, constraints, caching=True):
-        super().__init__(constraints, caching)
-        self.cp_prop = CPPropagate(constraints, caching=caching)
-
-    def propagate(self, domains, constraints, time_limit):
-        start_time = time.time()
-
-        # check cache
-        cached = self._probe_cache(domains, constraints)
-        if cached is not None: return cached
-
-        # do a very quick CP-prop first so domains are tighter
-        domains = self.cp_prop.propagate(domains, constraints, time_limit, only_unit_propagation=False)
-        if any(len(dom) == 0 for dom in domains.values()):
-            return domains # unsat
-
-
-        # only care about variables in constraints
-        cons_vars = set(get_variables(constraints))
-
-        solver = cp.SolverLookup.get("ortools")
-        solver += constraints
-        for var in cons_vars:  # set leftover domains of vars
-            solver += cp.Table([var], [[val] for val in domains[var]])
-
-        # check if model is UNSAT
-        if solver.solve() is False:
-            prop_dom = {var : frozenset() for var in domains}
-
-        else:
-            to_visit = {var : {val for val in domains[var]} for var in cons_vars}
-            while solver.solve():
-                if time_limit - (time.time() - start_time) <= EPSILON:
-                    raise TimeoutError("Maximal Propagate timed out")
-                for var in cons_vars:
-                    to_visit[var].discard(var.value())
-                # ensure next iteration visits at least one new value for a variable
-                lits = [var == val for var, vals in to_visit.items() for val in vals]
-                if len(lits) == 0:
-                    break
-                solver += cp.any(lits)
-
-
-            prop_dom = dict()
-            for var, dom in domains.items():
-                if var not in cons_vars: # unchanged domains
-                    prop_dom[var] = frozenset(dom)
-                else:
-                    prop_dom[var] = frozenset(dom - to_visit[var])
-
-        prop_dom = DomainSet(prop_dom)
-        # store new domains in cache
-        self._fill_cache(domains, constraints, prop_dom)
-        return prop_dom
-
-
-class MaximalPropagateSolveAll(MaximalPropagate):
-    """ Alternative implementation of maximal propagate using OR-tools solveAll function"""
-
-    def propagate(self, domains, constraints, time_limit):
-        start_time = time.time()
-
-        # check cache
-        cached = self._probe_cache(domains, constraints)
-        if cached is not None: return cached
-
-        # do a very quick CP-prop first so domains are tighter
-        cp_propped_domains = self.cp_prop.propagate(domains, constraints, time_limit, only_unit_propagation=False)
-        if any(len(dom) == 0 for dom in cp_propped_domains.values()):
-            return cp_propped_domains  # unsat
-
-        # only care about variables in constraints
-        cons_vars = set(get_variables(constraints))
-
-        solver = cp.SolverLookup.get("ortools")
-        solver += constraints
-        for var in cons_vars:  # set leftover domains of vars
-            solver += cp.Table([var], [[val] for val in cp_propped_domains[var]])
-
-
-        visisted = {var : set() for var in cons_vars}
-        def callback():
-            for var in cons_vars:
-                visisted[var].add(var.value())
-
-        solver.solveAll(display=callback)
-
-        prop_dom = dict()
-        for var, dom in domains.items():
-            if var not in cons_vars:  # unchanged domains
-                prop_dom[var] = frozenset(dom)
-            else:
-                prop_dom[var] = frozenset(visisted[var])
-        prop_dom = DomainSet(prop_dom)
-        # store new domains in cache
-        self._fill_cache(domains, constraints, prop_dom)
-        return prop_dom
-
-class ExactPropagate(MaximalPropagate):
-
-    def __init__(self, constraints, caching=True):
-        super().__init__(constraints, caching)
-        self.solver = cp.SolverLookup.get("exact")
-        # post reified constraints to solver
-        self.cons_dict = dict()
-        for cons in constraints:
-            bv = cp.boolvar(name=f"->{cons}")
-            self.cons_dict[cons] = bv
-            self.solver += bv.implies(cons)
-
-        # initialize solver and do all necesessary things in background
-        self.solver.xct_solver.setOption("verbosity", "0")
-        assert self.solver.solve()
-
-        # keep info of last call
-        self.last_call = {"domains": None, "constraints": None, "vars": None}
-
-    def propagate(self, domains, constraints, time_limit):
-        start_time = time.time()
-
-        # check cache
-        cached = self._probe_cache(domains, constraints)
-        if cached is not None:
-            return cached
-
-        # do a very quick CP-prop first so domains are tighter
-        cp_propped_domains = self.cp_prop.propagate(domains, constraints, time_limit, only_unit_propagation=False)
-        if any(len(dom) == 0 for dom in cp_propped_domains.values()):
-            return cp_propped_domains  # unsat
-
-        if not is_any_list(constraints):
-            constraints = [constraints]
-        # cache miss, set assumptions to solver
-        cons_vars = get_variables(constraints)
-
-        if cp_propped_domains != self.last_call["domains"]:
-            # domains changed, reset all assumptions (also for constraints as this is easier)
-            #print("Resetting domains")
-            self.solver.xct_solver.clearAssumptions()
-            # set new assumptions for domains
-            for var, dom in cp_propped_domains.items():
-                self.solver.xct_solver.setAssumption(self.solver.solver_var(var), list(dom))
-
-            # store domains of this call
-            self.last_call["domains"] = cp_propped_domains
-            self.last_call["constraints"] = None # reset all assumptions, so also the ones for the constraints
-        
-        # set assumptions for constraints
-        if set(constraints) != self.last_call["constraints"]:
-            if self.last_call["constraints"] is not None:
-                old_cons_assump = self.solver.solver_vars([self.cons_dict[cons] for cons in self.last_call["constraints"]])
-                # delete assumptions for previous constraints
-                for xct_assump in old_cons_assump:
-                    self.solver.xct_solver.clearAssumption(xct_assump)
-
-            # set assumptions for new constraints
-            new_cons_assump = self.solver.solver_vars([self.cons_dict[cons] for cons in constraints])
-            for xct_assump in new_cons_assump:
-                self.solver.xct_solver.setAssumption(xct_assump, [1])
-
-            # store constraints of this call
-            self.last_call["constraints"] = frozenset(constraints)
-
-        # do the propagation
-        # self.solver.xct_solver.setOption("timeout", str(int(time_limit - (time.time() - start_time))))
-        time_limit = time_limit - (time.time() - start_time)
-        new_domains = self.solver.xct_solver.pruneDomains(vars=self.solver.solver_vars(cons_vars), timeout=time_limit)
-        if len(new_domains) == 0:
-            raise TimeoutError("Exact propagate timed out")
-
-
-        # are we in the unsat case?
-        if any(len(dom) == 0 for dom in new_domains):
-            prop_dom = {var : frozenset() for var in cp_propped_domains}
-
-        else:
-            prop_dom = {var : frozenset(new_domains[i]) for i, var in enumerate(cons_vars)}
-            # make cons_vars a set
-            cons_vars = set(cons_vars)
-            for var, orig_dom in domains.items():
-                if var not in cons_vars:
-                    # unchanged domain
-                    prop_dom[var] = orig_dom
-
-        prop_dom = DomainSet(prop_dom)
-        # store new domains in cache
-        self._fill_cache(domains, constraints, prop_dom)
-
-        return prop_dom
-
-
-
-
+            return new_lits

@@ -3,113 +3,104 @@ from time import time
 import logging
 
 import cpmpy as cp
-from cpmpy.tools.mus import mus
+from cpmpy.tools.explain import mus, smus
 from cpmpy.transformations.get_variables import get_variables
-from cpmpy.transformations.normalize import toplevel_list
 
-from .datastructures import DomainSet, EPSILON
-from .propagate import MaximalPropagate, CPPropagate, ExactPropagate, MaximalPropagateSolveAll
-from .subset import smus
+from .datastructures import EPSILON
+from .propagate import ExactPropagate, CPPropagate, filter_lits_to_vars
 
 
-def filter_sequence(seq, goal_reduction, time_limit, propagator_class=MaximalPropagate):
+def filter_sequence(seq, goal_literals, time_limit, propagator_class=ExactPropagate):
     """
     Filter sequence from redundant steps.
         loops over sequence from back to front and attempts to leave out a step
         if the remaining sequence is still valid, it is removed, otherwise the step is kept in the sequence
     """
+    seq = copy.deepcopy(seq)
+    goal_literals = frozenset(goal_literals)
+
     start_time = time()
 
-    constraints = set().union(*[set(step.S) for step in seq])
+    constraints = set().union(*[set(step['constraints']) for step in seq])
     propagator = propagator_class(list(constraints), caching=True)
-    cp_propagator = CPPropagate(list(constraints), caching=True)
+    cp_propagator = CPPropagate(list(constraints), caching=False)
 
-    conflict_cache = dict()
-    def _has_conflict(Rin, seq):
+    def _has_conflict(literals, seq):
+        # check if there is a conflict in the remainding constaints and given input literals
+        cons = set().union(*[step['constraints'] for step in seq])
+        return cp.Model(list(literals) + list(cons)).solve() is False
 
-        cons = frozenset(toplevel_list([step.S for step in seq]))
-        if cons in conflict_cache:
-            cache = conflict_cache[cons]
-            if any(is_unsat for dom, is_unsat in cache.items() if Rin <= dom):
-                return True
-            elif any(is_unsat is False for dom, is_unsat in cache.items() if Rin >= dom):
-                return False
-        else:
-            conflict_cache[cons] = dict()
+    unsat_sequences = dict() # cache unsat subsequences, mapping seq of constraints to set of literals
+    sat_sequences = dict() # cache sat subsequences, mapping seq of constraints to set of literals
 
-        m = cp.Model(list(cons))
-        for var, dom in Rin.items():
-            m += cp.Table([var], [[val] for val in dom])
-        is_unsat = m.solve() is False
-
-        conflict_cache[cons][Rin] = is_unsat
-        return is_unsat
-
-
-    unsat_sequences = dict()
-    sat_sequences = dict()
-
-    def _try_deletion(Rin, seq):
+    def _try_deletion(lits_in, seq):
         # test if remaining sequence is still valid
-        subsequences = dict()  # will encounter every subsequence maximum once
+        subsequences = dict()  # will encounter every subsequence maximum once, save whether it is sat or unsat
 
-        D = Rin
+        current_lits = lits_in
         unsat = None
         for j, step in enumerate(seq):
             if time_limit - (time() - start_time) <= EPSILON:
                 raise TimeoutError("Filtering timed out")
+            
+            current_lits = frozenset(current_lits)
+            
+            str_constraints = str([x['constraints'].__repr__() for x in seq[j:]]) # string representation of constraints, used in cache
+            seq_vars = frozenset(get_variables([x['constraints'] for x in seq[j:]]))
+            seq_lits = frozenset(filter_lits_to_vars(current_lits, seq_vars))
+            
+            step_vars = frozenset(get_variables(step['constraints']))
+            step_lits = frozenset(filter_lits_to_vars(current_lits, step_vars))
 
-            str_constraints = str([S for _, S, _ in seq[j:]])
-            D_vars = DomainSet({var : D[var] for var in get_variables([S for _,S,_ in seq[j:]])})
             assert str_constraints not in subsequences, "We encountered this sequence already, should not happen!"
-            subsequences[str_constraints] = D_vars
-            cons_vars = get_variables(step.S)
+            subsequences[str_constraints] = seq_lits
 
-            if D <= goal_reduction:
-                # we can definitely stop
+            if goal_literals <= current_lits:
+                # found the target, we can definitely stop
                 unsat = True
                 break
-            elif D <= step.Rin:
-                # we can deduce Rout from Rin and S, so definitely from D and S
+            elif step['input'] <= current_lits:
+                # we know we can deduce Rout from Rin and S, so definitely from D and S
                 # This holds for all remaining steps in the sequence assuming it was valid in the first place.
                 # So the sequence is valid
                 unsat = True
                 break
-            elif str_constraints in unsat_sequences and any(D_vars <= dom for dom in unsat_sequences[str_constraints]):
+            elif str_constraints in unsat_sequences and any(unsat_lits <= seq_lits for unsat_lits in unsat_sequences[str_constraints]):
                 # we decided this sequence ends in UNSAT with less literals, so this one definitely
                 unsat = True  # should never happen as input is maximal
                 break
-            elif str_constraints in sat_sequences and any(D_vars >= dom for dom in sat_sequences[str_constraints]):
+            elif str_constraints in sat_sequences and any(sat_lits >= seq_lits for sat_lits in sat_sequences[str_constraints]):
                 # we decided this sequence ends in SAT with more literals, so this one definitely
                 unsat = False
                 break
-            elif step.type == "max" and all(D[var] == step.Rin[var] for var in cons_vars):
-                # no need to propagate, we can copy over the relevant parts of the domains from Rin to Rout
-                D = DomainSet(dict(D) | {var: step.Rout[var] for var in cons_vars})
-                if any(len(dom) == 0 for dom in D.values()):
-                    # unsat, must make entire reduction empty
-                    D = DomainSet({var : frozenset() for var in step.Rin})
+            elif step_lits == frozenset(filter_lits_to_vars(step['input'], step_vars)):
+                # relevant literals are the same as original input, so no need to propagate
+                # output will be current input + original output of step
+                step['output'] = current_lits | step['output']
+                current_lits = step['output']
                 continue
-            elif _has_conflict(D_vars, seq[j:]):
+            elif _has_conflict(current_lits, seq[j:]):
                 # there is still a conflict left based on constraints
                 # can we get there using CP-propagation?
-                Dcp= copy.deepcopy(D)
-                for _,Scp,_ in seq[j:]:
-                    Dcp = cp_propagator.propagate(Dcp, Scp, time_limit=time_limit - (time() - start_time))
-                # we can get the goal reduction using only CP-steps, so definitely using maxprop steps
-                if Dcp <= goal_reduction:
-                    unsat = True
+                lits_CP = copy.deepcopy(current_lits)
+                for x in seq[j:]:
+                    lits_CP = cp_propagator.propagate(list(lits_CP), list(x['constraints']), time_limit=time_limit - (time() - start_time))
+                    # we can get the goal reduction using only CP-steps, so definitely using maxprop steps
+                    if goal_literals <= lits_CP:
+                        unsat = True
+                        break
+                if unsat is True: # reached goal using CP-propagation
                     break
-
-                # now we have to check what we can deduce from Rin and S
-                D = propagator.propagate(D, step.S, time_limit=time_limit - (time() - start_time))
+                else: # could not get goal reduction using CP-propagationg CP-propagation
+                    # go to default, re-compute step using maxprop
+                    current_lits = propagator.propagate(current_lits, step['constraints'], time_limit=time_limit - (time() - start_time))       
             else:
                 # no conflict left in constraints, definitely not in stepwise manner either
                 unsat = False
                 break
 
         if unsat is None:
-            unsat = D <= goal_reduction
+            unsat = goal_literals <= current_lits
 
         dict_to_add = unsat_sequences if unsat else sat_sequences
         # store all subsequences we encountered along the way with their initial domain
@@ -125,137 +116,109 @@ def filter_sequence(seq, goal_reduction, time_limit, propagator_class=MaximalPro
     i = len(seq)-1
     while i >= 0:
         # try deleting step i and check if still valid sequence
-        if _try_deletion(seq[i].Rin, seq[i+1:]):
+        if _try_deletion(seq[i]['input'], seq[i+1:]):
             seq.pop(i)
         i -= 1
 
     # now fixup all domains in the sequence
     # set input domain to given set
-    seq[0].Rin = DomainSet.from_literals(seq[0].Rin.keys(), {})
+
+    current_literals = list()
     for i, step in enumerate(seq):
-        step.Rout = propagator.propagate(step.Rin, step.S, time_limit=time_limit-(time() - start_time))
-        if i < len(seq)-1:
-            seq[i+1].Rin = step.Rout
-        if step.Rout <= goal_reduction:
-            return seq[:i+1]
+        step["input"] = frozenset(current_literals)
+        
+        new_literals = propagator.propagate(current_literals, step['constraints'], time_limit=time_limit-(time() - start_time))
+        step["output"] = frozenset(set(new_literals) - step["input"])
+        
+        current_literals = list(new_literals)
+
+        if goal_literals <= step['output']:
+            return seq[:i+1] # can stop here
 
     return seq
 
-def relax_sequence(seq, mus_type="mus", time_limit=3600):
+def relax_sequence(seq, mus_solver="ortools", time_limit=3600):
     """
     Minimizes input literals for each step.
     Keeps a set of literals that need to be derived, only derive those in previous steps.
     """
+    seq = copy.deepcopy(seq)
+
     start_time = time()
 
-    all_constraints = set().union(*[set(step.S) for step in seq])
-    propagator = MaximalPropagateSolveAll(constraints = list(all_constraints))
+    all_constraints = set().union(*[set(step['constraints']) for step in seq])
+    propagator = ExactPropagate(constraints = list(all_constraints))
 
-    if mus_type == "mus":
-        get_mus = mus
-    elif mus_type == "smus":
-        get_mus = smus
-    else:
-        raise ValueError(f"Unknown MUS-type: {mus_type}")
+    if len(seq) == 1:
+        return seq
 
-    soft = list(seq[-1].Rin.literals())
-    if len(soft):
-        lits_in = mus(soft=list(seq[-1].Rin.literals()), hard=seq[-1].S)
-        seq[-1].Rin = DomainSet.from_literals(seq[-1].Rin.keys(), lits_in)
-        R = seq[-1].Rin.literals()
-        i = len(seq)-2
-    else:
-        return seq # length of sequence = 1
+    required = mus(soft=list(seq[-1]['input']),
+                   hard=list(seq[-1]['constraints']) + [~cp.all(list(seq[-1]['output']))],
+                   solver=mus_solver)
+    required = frozenset(required)
+    seq[-1]['input'] = required
+    i = len(seq)-2
 
     while i >= 0:
         if time_limit - (time() - start_time) <= EPSILON:
             raise TimeoutError("Relaxing sequence timed out")
         step = seq[i]
         # find the set of literals derived in this step we actually need later in the sequence
-        newlits = step.Rout.literals() - step.Rin.literals()
-        new_required_lits = R & newlits
-        step.Rout = DomainSet.from_literals(step.Rout.keys(), new_required_lits)
+        newlits = step['output'] - step['input']
+        new_required_lits = required & newlits
+        step['output'] = new_required_lits
         if len(new_required_lits) == 0:
             # step can be removed from sequence as no newly derived literal is required
             # Note: this case should never occur when running on non-redundant sequences!
             seq.pop(i)
         else:
             # this step derives at least one new literal needed later on in the sequence, so we have to keep it
-            cons_vars = set(get_variables(step.S))
-            # shrink Rin to literals related to variables in constraints
-            step.Rin = DomainSet({var : dom if var in cons_vars else frozenset(range(var.lb,var.ub+1)) for var, dom in step.Rin.items()})
-            soft = step.Rin.literals()
-            hard = step.S + [cp.any([~lit for lit in step.Rout.literals()])]
-            # an optimization to mainly use literals in input we need later on in the sequence anyway.
-            # These literals are derived by a step earlier on in the sequence so we can use them here "for free".
-            # Other literals in the current input of the step are also derived earlier, but may not actually be necessary
-            #   and can therefore be deleted from outputs of previous steps when chosing the input for this step in a smart way.
-            # Intuitively, we want R to stay as small as possible!
-            soft1, hard1 = soft - R, hard + list(R & step.Rin.literals())
-            if len(soft1) == 0:
-                lits_in1 = []
-            else:
-                lits_in1 = get_mus(list(soft1), hard1)
+            # we have a preference over literals that we already need anyway
+            already_needed = step['input'] & required
+            maybe_needed = step['input'] - required
 
-            soft2, hard2 = soft & R, hard + lits_in1
-            if len(soft2) == 0:
-                lits_in2 = []
-            else:
-                lits_in2 = get_mus(list(soft2), hard2)
+            extra_required_lits = mus(soft=list(maybe_needed),
+                                      hard=list(already_needed) + list(step['constraints']) + [~cp.all(list(step['output']))],
+                                      solver=mus_solver)
+            
+            already_required_lits = mus(soft=list(already_needed),
+                                        hard=list(extra_required_lits) + list(step['constraints']) + [~cp.all(list(step['output']))],
+                                        solver=mus_solver)
+            
+            step['input'] = frozenset(already_required_lits + extra_required_lits)
 
-            lits_in = set(lits_in1) | set(lits_in2)
-            step.Rin = DomainSet.from_literals(step.Rin.keys(), lits_in)
+            # actually, we might be able to derive more than was originally "new"!
+            new_output = propagator.propagate(step['input'], step['constraints'], time_limit=time_limit - (time() - start_time))
+            step['output'] = (frozenset(new_output) - step['input']) & required
 
-            step.Rout = propagator.propagate(domains=step.Rin, constraints=list(step.S), time_limit=time_limit-(time()-start_time))
-
-            # update required literals
-            R = (R - step.Rout.literals()) | step.Rin.literals()
-
+            required = (required - step['output']) | step['input']
+            
         i -= 1
     return make_pertinent(seq)
 
 
-def filter_simple(seq, time_limit=3600):
-    start_time = time()
-
-    # relax every step
-    for step in seq:
-        if time_limit <= EPSILON:
-            raise TimeoutError("Filtering strongly redundant timed out during relaxation")
-        mus_start = time()
-        step.relax(mus_type="smus", solver="ortools", time_limit= time_limit - (time() - start_time))
-
-    required = seq[-1].Rin.literals()
-    i = len(seq)-2 # never delete last step
-    while i >= 0:
-        step = seq[i]
-        newlits = step.Rout.literals() - step.Rin.literals()
-        if len(newlits & required) == 0:
-            # we do not use any new literal later on, so delete the step
-            seq.pop(i)
-        else: # we need the step
-            required |= step.Rin.literals()
-        i -= 1
-
-    return seq
-
-
-
 def make_pertinent(seq):
+    """
+        Make sequence pertinent. i.e., remove literals that are already derived
+    """
     derived_already = set()
-    need_lits = set().union(*[step.Rin.literals() for step in seq])
+    need_lits = set().union(*[step['input'] for step in seq] + [seq[-1]['output']])
 
-    for step in seq[:-1]: # last step contains everything
-        outlits = ((step.Rout.literals() - step.Rin.literals()) & need_lits) - derived_already
-        step.Rout = DomainSet.from_literals(step.Rout.keys(), outlits)
+    for step in seq:
+        outlits = ((step['output'] - step['input']) & need_lits) - derived_already
+        step['output'] = outlits
         derived_already |= outlits
     return seq
 
 
 def seq_is_pertinent(seq):
+    """
+        Check if a sequence is pertinent.
+        i.e., no literals are derived in a step that are already derived in a previous step.
+    """
     derived_already = set()
-    for step in seq[:-1]: # last step can derive everything
-        if len(step.Rout.literals() & derived_already) or len(step.Rin.literals() & step.Rout.literals()):
+    for step in seq:
+        if len(step['output'] & derived_already) or len(step['input'] & step['output']):
             return False
-        derived_already |= set(step.Rout.literals())
+        derived_already |= set(step['output'])
     return True
