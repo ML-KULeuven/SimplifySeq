@@ -13,7 +13,7 @@ def find_sequence(constraints, goal_literals=UNSAT, propagator=ExactPropagate, s
     """
 
     # construct initial sequence
-    seq = construct_greedy(constraints, goal_literals, time_limit, seed, propagator_class=propagator)
+    seq = construct_greedy(constraints, goal_literals, time_limit, seed, PROP=propagator)
     print("Found initial sequence of length", len(seq))
 
     # filter sequence
@@ -21,7 +21,7 @@ def find_sequence(constraints, goal_literals=UNSAT, propagator=ExactPropagate, s
     print("Filtered sequence of length", len(seq))
 
     # relax sequence
-    seq = relax_sequence(seq, time_limit=time_limit, propagator_class=propagator)
+    seq = relax_sequence(seq, time_limit=time_limit)
     print("Relaxed sequence of length", len(seq))
 
     return seq
