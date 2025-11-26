@@ -1,13 +1,12 @@
 import copy
 from time import time
-import logging
 
 import cpmpy as cp
 from cpmpy.tools.explain import mus, smus
-from cpmpy.transformations.get_variables import get_variables
+from cpmpy.expressions.core import Expression
 
 from .propagate import ExactPropagate, CPPropagate, filter_lits_to_vars
-from .utils import EPSILON
+from .utils import EPSILON, get_variables
 
 
 def filter_sequence(seq, goal_literals, time_limit, propagator_class=ExactPropagate):
@@ -76,8 +75,9 @@ def filter_sequence(seq, goal_literals, time_limit, propagator_class=ExactPropag
             elif step_lits == frozenset(filter_lits_to_vars(step['input'], step_vars)):
                 # relevant literals are the same as original input, so no need to propagate
                 # output will be current input + original output of step
-                step['output'] = current_lits | step['output']
-                current_lits = step['output']
+                current_lits = step['output'] | current_lits
+                # step['output'] = current_lits | step['output']
+                # current_lits = step['output']
                 continue
             elif _has_conflict(current_lits, seq[j:]):
                 # there is still a conflict left based on constraints
@@ -129,6 +129,8 @@ def filter_sequence(seq, goal_literals, time_limit, propagator_class=ExactPropag
         
         new_literals = propagator.propagate(current_literals, step['constraints'], time_limit=time_limit-(time() - start_time))
         step["output"] = frozenset(set(new_literals) - step["input"])
+
+        assert step['output'] != set(), f"Expected to be able to derive a new literal, but step {step} did not."
         
         current_literals = list(new_literals)
 

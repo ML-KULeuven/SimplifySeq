@@ -1,11 +1,12 @@
 import cpmpy as cp
-from cpmpy.transformations.get_variables import get_variables
-from cpmpy.expressions.utils import is_any_list
+from cpmpy.expressions.utils import is_any_list, flatlist
 from cpmpy.expressions.core import Comparison, Expression, BoolVal
 from cpmpy.expressions.variables import _NumVarImpl
 from cpmpy.tools.explain.utils import make_assump_model
 from cpmpy.solvers.solver_interface import ExitStatus
 from cpmpy.transformations.normalize import toplevel_list
+
+from .utils import get_variables
 
 def filter_lits_to_vars(literals, vars):
     vars = frozenset(vars)
@@ -102,6 +103,7 @@ class MaximalPropagate(Propagator):
         """
 
         literals = list(literals)
+        constraints = flatlist([constraints])
         constraints = toplevel_list(constraints, merge_and=False)
 
         # check cache
@@ -153,7 +155,8 @@ class MaximalPropagateSolveAll(Propagator):
         """
 
         literals = list(literals)
-        constraints = toplevel_list(constraints, merge_and=False)
+        constraints = flatlist([constraints])
+        constraints = toplevel_list(list(constraints), merge_and=False)
 
         # check cache
         cached = self._probe_cache(literals, constraints)
@@ -214,7 +217,8 @@ class ExactPropagate(Propagator):
         """
 
         literals = list(literals)
-        constraints = toplevel_list(constraints, merge_and=False)
+        constraints = flatlist([constraints])
+        constraints = toplevel_list(list(constraints), merge_and=False)
         
         # check cache
         cached = self._probe_cache(literals, constraints)
